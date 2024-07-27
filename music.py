@@ -132,6 +132,8 @@ class Bot(commands.Bot):
         print(f'Connected to channel: {TWITCH_CHANNEL}')
         await self.loop.run_in_executor(None, self.load_stats)
         await self.get_channel(TWITCH_CHANNEL).send('Bot has connected!')
+        # Запуск задачи для отправки напоминания
+        self.loop.create_task(self.send_reminder())
 
     async def event_message(self, message):
         if message.author is not None and message.content is not None:
@@ -221,6 +223,13 @@ class Bot(commands.Bot):
         else:
             level_msg = f"{ctx.author.name}, у вас пока нет очков и уровней."
         await ctx.send(level_msg)
+
+    async def send_reminder(self):
+        while True:
+            await asyncio.sleep(3600)  # Ждем 1 час
+            await self.get_channel(TWITCH_CHANNEL).send('''!фоксимузыку, !музыка, !твайлижги, !опенинг, !статистика –
+                                                        Теперь когда я онлайн вы можете использовать эти команды и 
+                                                        заказать случайную музыку из плейлиста составленного мной ''')
 
     async def shutdown(self):
         await self.get_channel(TWITCH_CHANNEL).send('Bot has been stopped!')
