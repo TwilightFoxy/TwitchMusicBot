@@ -1,68 +1,136 @@
-import subprocess
-import sys
-
-# Список зависимостей
-dependencies = [
-    "twitchio",
-    "pytube",
-    "requests"
-]
-
-# Функция для установки зависимостей
-def install_dependencies():
-    for package in dependencies:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-
-# Установка зависимостей
-install_dependencies()
-
-# Остальной код бота
 import json
 import random
 import asyncio
+import sqlite3
+import requests
+import logging
 from twitchio.ext import commands
-from collections import defaultdict
 from pytube import YouTube
 
-# Конфигурация Twitch можно получить на сайте https://twitchtokengenerator.com.
-# Чтобы не париться просто выдайте все права (или только на чтение-отправку сообщений)
-TWITCH_TOKEN = 'oauth:XXX' #ACCESS TOKEN
-CLIENT_ID = 'XXX' #CLIENT ID
-TWITCH_CHANNEL = 'XXX'#Название канала
-STAT_FILE = 'stats.json'
+# Настройка логирования для подавления ошибок в консоли
+logging.basicConfig(level=logging.INFO)
 
-with open('links.txt', 'r') as file: #В этот файл загрузить ссылки на ютуб музыку
-    links = file.read().splitlines()
-    total_tracks = len(links)
+# Конфигурация Twitch
+TWITCH_TOKEN = 'oauth:XXX'
+CLIENT_ID = 'XXX'
+TWITCH_CHANNEL = 'XXX'
+DATABASE_FILE = 'stats.db'
+
+# Загрузка ссылок из файла
+LINKS_FILE = 'links.txt'
 
 
 class Bot(commands.Bot):
 
     def __init__(self):
         super().__init__(token=TWITCH_TOKEN, prefix='!', initial_channels=[TWITCH_CHANNEL])
-        self.track_requests = defaultdict(int)
-        self.user_requests = defaultdict(int)
-        self.load_stats()
+        self.database = None
+        self.loop = asyncio.get_event_loop()
+
+    def create_tables(self):
+        with self.database:
+            self.database.execute('''
+                CREATE TABLE IF NOT EXISTS user_stats (
+                    username TEXT PRIMARY KEY,
+                    points INTEGER DEFAULT 0,
+                    level INTEGER DEFAULT 1
+                )
+            ''')
+
+            self.database.execute('''
+                CREATE TABLE IF NOT EXISTS track_requests (
+                    username TEXT,
+                    track TEXT,
+                    UNIQUE (username, track)
+                )
+            ''')
+
+            self.database.execute('''
+                CREATE TABLE IF NOT EXISTS tracks (
+                    track TEXT PRIMARY KEY
+                )
+            ''')
 
     def load_stats(self):
-        try:
-            with open(STAT_FILE, 'r') as f:
-                data = json.load(f)
-                self.track_requests.update(data.get('track_requests', {}))
-                self.user_requests.update(data.get('user_requests', {}))
-        except FileNotFoundError:
-            print("Stat file not found. Starting with empty stats.")
+        self.database = sqlite3.connect(DATABASE_FILE)
+        self.create_tables()
+        self.load_links()
 
-    def save_stats(self):
-        with open(STAT_FILE, 'w') as f:
-            json.dump({
-                'track_requests': self.track_requests,
-                'user_requests': self.user_requests
-            }, f)
+    def load_links(self):
+        with self.database:
+            db_links = {row[0] for row in self.database.execute('SELECT track FROM tracks')}
+
+        with open(LINKS_FILE, 'r') as file:
+            file_links = {line.strip() for line in file.readlines()}
+
+        new_links = file_links - db_links
+
+        with self.database:
+            self.database.executemany('INSERT OR IGNORE INTO tracks (track) VALUES (?)',
+                                      [(link,) for link in new_links])
+
+    def save_user_stats(self, user, points, level):
+        with self.database:
+            self.database.execute('''
+                INSERT INTO user_stats (username, points, level)
+                VALUES (?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    points=excluded.points,
+                    level=excluded.level
+            ''', (user, points, level))
+
+    def save_track_request(self, user, track):
+        with self.database:
+            self.database.execute('''
+                INSERT OR IGNORE INTO track_requests (username, track)
+                VALUES (?, ?)
+            ''', (user, track))
+
+    def update_user_stats(self, user, track):
+        with self.database:
+            row = self.database.execute('SELECT points, level FROM user_stats WHERE username = ?', (user,)).fetchone()
+            if row:
+                points, level = row
+            else:
+                points, level = 0, 1
+
+        points += 10
+        if points >= level * 100:
+            points -= level * 100
+            level += 1
+
+        self.save_user_stats(user, points, level)
+        self.save_track_request(user, track)
+
+    def get_user_stats(self, user):
+        with self.database:
+            return self.database.execute('SELECT points, level FROM user_stats WHERE username = ?', (user,)).fetchone()
+
+    def get_user_tracks(self, user):
+        with self.database:
+            row = self.database.execute('SELECT COUNT(DISTINCT track) FROM track_requests WHERE username = ?',
+                                        (user,)).fetchone()
+            return row[0] if row else 0
+
+    def get_top_tracks(self):
+        with self.database:
+            return self.database.execute(
+                'SELECT track, COUNT(*) as count FROM track_requests GROUP BY track ORDER BY count DESC LIMIT 5').fetchall()
+
+    def get_top_users(self):
+        with self.database:
+            return self.database.execute(
+                'SELECT username, COUNT(*) as count FROM track_requests GROUP BY username ORDER BY count DESC LIMIT 5').fetchall()
+
+    def get_total_tracks(self):
+        with self.database:
+            row = self.database.execute('SELECT COUNT(*) FROM tracks').fetchone()
+            return row[0] if row else 0
 
     async def event_ready(self):
         print(f'Logged in as {self.nick}')
         print(f'Connected to channel: {TWITCH_CHANNEL}')
+        await self.loop.run_in_executor(None, self.load_stats)
         await self.get_channel(TWITCH_CHANNEL).send('Bot has connected!')
 
     async def event_message(self, message):
@@ -71,15 +139,20 @@ class Bot(commands.Bot):
             await self.handle_commands(message)
 
     async def sr(self, ctx):
-        link = random.choice(links)
+        row = await self.loop.run_in_executor(None, lambda: self.database.execute(
+            'SELECT track FROM tracks ORDER BY RANDOM() LIMIT 1').fetchone())
+        link = row[0] if row else None
+
+        if not link:
+            await ctx.send("No tracks available.")
+            return
+
         print(f'Selected link: {link}')
         try:
             yt = YouTube(link)
             title = yt.title
             print(f'Video title: {title}')
-            self.track_requests[title] += 1
-            self.user_requests[ctx.author.name] += 1
-            self.save_stats()
+            await self.loop.run_in_executor(None, self.update_user_stats, ctx.author.name, title)
             print("Attempting to send video title to chat...")
             await ctx.send(f'Название видео: {title}')
             print("Video title sent to chat")
@@ -113,14 +186,16 @@ class Bot(commands.Bot):
 
     @commands.command(name='статистика')
     async def command_stats(self, ctx):
-        print("Received command: статистика")
-        top_tracks = sorted(self.track_requests.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_users = sorted(self.user_requests.items(), key=lambda x: x[1], reverse=True)[:5]
-        unlocked_tracks = len([count for count in self.track_requests.values() if count > 0])
+        top_tracks = await self.loop.run_in_executor(None, self.get_top_tracks)
+        top_users = await self.loop.run_in_executor(None, self.get_top_users)
+        user_stats = await self.loop.run_in_executor(None, self.get_user_stats, ctx.author.name)
+        user_unlocked_tracks = await self.loop.run_in_executor(None, self.get_user_tracks, ctx.author.name)
+        total_tracks = await self.loop.run_in_executor(None, self.get_total_tracks)
 
-        top_tracks_msg = "Топ 5 треков: " + " | ".join([f"{track}: {count}" for track, count in top_tracks])
-        top_users_msg = "Топ 5 пользователей: " + " | ".join([f"{user}: {count}" for user, count in top_users])
-        unlocked_tracks_msg = f"Треков разблокировано: {unlocked_tracks} / {total_tracks}"
+        top_tracks_msg = "Топ 5 популярных треков: " + " | ".join([f"{track}: {count}" for track, count in top_tracks])
+        top_users_msg = "Топ 5 активных пользователей: " + " | ".join([f"{user}: {count}" for user, count in top_users])
+        unlocked_tracks_msg = f"Всего треков разблокировано: {user_unlocked_tracks} / {total_tracks}"
+        user_unlocked_tracks_msg = f"{ctx.author.name} разблокировал: {user_unlocked_tracks} / {total_tracks}"
 
         await asyncio.sleep(3)
         print("Attempting to send top tracks to chat...")
@@ -133,7 +208,37 @@ class Bot(commands.Bot):
         await asyncio.sleep(3)
         print("Attempting to send unlocked tracks to chat...")
         await ctx.send(unlocked_tracks_msg)
+        await asyncio.sleep(3)
+        await ctx.send(user_unlocked_tracks_msg)
         print("Unlocked tracks sent to chat")
+
+    @commands.command(name='уровень')
+    async def command_level(self, ctx):
+        user_stats = await self.loop.run_in_executor(None, self.get_user_stats, ctx.author.name)
+        if user_stats:
+            points, level = user_stats
+            level_msg = f"{ctx.author.name}, ваш уровень: {level}, очки: {points}"
+        else:
+            level_msg = f"{ctx.author.name}, у вас пока нет очков и уровней."
+        await ctx.send(level_msg)
+
+    async def shutdown(self):
+        await self.get_channel(TWITCH_CHANNEL).send('Bot has been stopped!')
+        self.database.close()
+        await self.close()
+
+
+async def main():
+    print("Validating token...")
+    validate_token(TWITCH_TOKEN.split('oauth:')[1])
+    print("Starting bot...")
+    bot = Bot()
+
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        await bot.shutdown()
+
 
 def validate_token(token):
     headers = {
@@ -147,10 +252,11 @@ def validate_token(token):
         print("Token is invalid")
         print(response.status_code, response.text)
 
+
 if __name__ == "__main__":
-    print("Validating token...")
-    validate_token(TWITCH_TOKEN.split('oauth:')[1])
-    print("Starting bot...")
-    bot = Bot()
-    bot.run()
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Error running the bot: {e}")
+
     print("Bot started")
